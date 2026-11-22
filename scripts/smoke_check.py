@@ -1,7 +1,9 @@
 """对运行中的网页服务做端到端冒烟（纯标准库，可在容器外执行）。
 
 覆盖：CSV 上传、登记/更正/撤回、估数门控（缺类/不满秩撤下、补检恢复）、
-全检实数、台数守恒，以及两个“窗口”并发修改不同机器两笔都生效。
+全检实数、台数守恒、两个“窗口”并发修改不同机器两笔都生效，以及漂移监测
+（参考矩阵校验、累计似然比、首次过线告警、更正/撤回/再登记重算、新批次
+清空）。
 
 用法：python scripts/smoke_check.py [base_url] [csv_path]
 """
@@ -16,6 +18,12 @@ import urllib.error
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
 CSV_PATH = sys.argv[2] if len(sys.argv) > 2 else "data/sample_machines.csv"
 CATS = ("power", "drive", "control")
+# 出厂校准参考矩阵：行=实检，列=初判，每项为正，每行和为 1。
+REF = [
+    [0.80, 0.13, 0.07],
+    [0.12, 0.78, 0.10],
+    [0.05, 0.15, 0.80],
+]
 
 
 def call(method: str, path: str, body=None, raw: bytes | None = None,
@@ -162,4 +170,104 @@ check("全部拆完直接给实数",
       e["n_uninspected"] == 0 and e["available"] and e["pi"] is None)
 check("实数合计=总台数", sum(e["actual_total"].values()) == n_total)
 print(f"       实检实数: {e['actual_total']}")
+
+# 9. 漂移监测：新批次清空后重走一条可复演的告警生命周期
+print("\n— 漂移监测 —")
+# 5 台 control 初判（高比值素材）+ 2 台 power 初判（低比值素材，用于回落）
+drift_csv = (
+    "机器编号,初判\n"
+    + "".join(f"D{i},control\n" for i in range(1, 6))
+    + "E1,power\nE2,power\n"
+)
+status, snap = call("POST", "/api/batch", raw=(
+    f"------b\r\nContent-Disposition: form-data; name=\"file\"; "
+    f"filename=\"d.csv\"\r\nContent-Type: text/csv\r\n\r\n"
+).encode() + drift_csv.encode() + b"\r\n------b--\r\n",
+    ctype="multipart/form-data; boundary=----b")
+check("漂移演示批次上传", status == 200)
+check("新批次监测已清空（无参考矩阵、无顺序、无告警）",
+      not snap["drift"]["configured"] and snap["drift"]["order"] == []
+      and snap["drift"]["alert"] is None)
+
+# 9.1 无效矩阵全部 400，且不产生配置
+for bad in [
+    [[0.0, 0.3, 0.7], [0.2, 0.7, 0.1], [0.1, 0.1, 0.8]],   # 含 0
+    [[0.8, 0.13, 0.08], [0.12, 0.78, 0.1], [0.05, 0.15, 0.8]],  # 行和≠1
+    [[1, 0], [0, 1], [0, 0]],                                # 形状错
+]:
+    status, _ = call("POST", "/api/drift/reference", {"matrix": bad})
+    check(f"无效矩阵被拒（{bad[0]}…）", status == 400)
+status, s = call("GET", "/api/batch")
+check("被拒后仍未配置参考矩阵", not s["drift"]["configured"])
+
+# 9.2 录入有效参考矩阵
+status, s = call("POST", "/api/drift/reference", {"matrix": REF})
+check("有效参考矩阵录入成功", status == 200 and s["drift"]["configured"])
+
+# 9.3 连登三台 power 实检/control 初判：LR≈4.76 → 34.01 → 291.55，D3 首个过线
+for mid in ("D1", "D2", "D3"):
+    status, s = call("POST", f"/api/machines/{mid}/inspect",
+                     {"category": "power"})
+    check(f"登记 {mid}", status == 200)
+alert = s["drift"]["alert"]
+check("首个过线告警锁定 D3（LR≥60）",
+      alert is not None and alert["machine_id"] == "D3"
+      and alert["category"] == "power" and alert["order"] == 3,
+      f"alert={alert}")
+check("告警机器清单与记录同源（顺序=已登记序列）",
+      s["drift"]["order"] == ["D1", "D2", "D3"])
+
+# 9.4 比值回落但告警保留：再登两台 power 实检/power 初判（每台比值<1）
+for mid in ("E1", "E2"):
+    status, s = call("POST", f"/api/machines/{mid}/inspect",
+                     {"category": "power"})
+check("比值回落之后告警仍保留（黏性）",
+      s["drift"]["likelihood_ratios"]["power"] < 60
+      and s["drift"]["alert"]["machine_id"] == "D3",
+      f"lr={s['drift']['likelihood_ratios']['power']:.3f}")
+
+# 9.5 更正 D3 为 control（原位）：power 类只剩 4 条，重算无过线点 -> 撤下；
+#     顺序位置不变（更正保留原位置）
+status, s = call("POST", "/api/machines/D3/inspect", {"category": "control"})
+check("更正保留原位置", s["drift"]["order"][2] == "D3")
+check("更正重算后无过线点 -> 撤下告警", s["drift"]["alert"] is None,
+      f"lr={s['drift']['likelihood_ratios']['power']:.3f}")
+
+# 9.6 撤回 / 再登记：先清掉 9.4 用于“回落”的低比值素材 E1/E2，
+#     使 power 序列回到干净的 D1、D2（LR 止于 34.01，无过线点）。
+for mid in ("E1", "E2"):
+    status, s = call("POST", f"/api/machines/{mid}/withdraw")
+check("回落素材撤回后仍无过线点", s["drift"]["alert"] is None
+      and s["drift"]["order"] == ["D1", "D2", "D3"],
+      f"order={s['drift']['order']}")
+# 登记 D4：power 类的第三个高比值样本；D3 仍占顺序 #3 但已是 control，
+# 故 D4 位于顺序 #4，并在该位置使 power 类 LR 过线。
+status, s = call("POST", "/api/machines/D4/inspect", {"category": "power"})
+check("登记 D4 后第三个 power 样本过线",
+      s["drift"]["alert"] is not None
+      and s["drift"]["alert"]["machine_id"] == "D4"
+      and s["drift"]["alert"]["order"] == 4,
+      f"alert={s['drift']['alert']}")
+status, s = call("POST", "/api/machines/D4/withdraw")
+check("撤回 D4：记录移除且重算后无过线点 -> 撤下告警",
+      "D4" not in s["drift"]["order"] and s["drift"]["alert"] is None,
+      f"lr={s['drift']['likelihood_ratios']['power']:.3f}")
+status, s = call("POST", "/api/machines/D4/inspect", {"category": "power"})
+check("再登记 D4 排到末尾，并在末尾重新成为首个过线点",
+      s["drift"]["order"][-1] == "D4"
+      and s["drift"]["alert"] is not None
+      and s["drift"]["alert"]["machine_id"] == "D4"
+      and s["drift"]["alert"]["order"] == len(s["drift"]["order"]),
+      f"alert={s['drift']['alert']}")
+
+# 9.7 再次上传批次 -> 监测彻底清空，旧告警不可能被快照恢复
+status, s = call("POST", "/api/batch", raw=(
+    f"------b\r\nContent-Disposition: form-data; name=\"file\"; "
+    f"filename=\"d2.csv\"\r\nContent-Type: text/csv\r\n\r\n"
+).encode() + b"\xe6\x9c\xba\xe5\x99\xa8\xe7\xbc\x96\xe5\x8f\xb7,\xe5\x88\x9d\xe5\x88\xa4\r\nZ1,power\r\n------b--\r\n",
+    ctype="multipart/form-data; boundary=----b")
+check("再传新批次后监测清空",
+      s["drift"]["configured"] is False and s["drift"]["alert"] is None
+      and s["drift"]["order"] == [])
+
 print("\n全部冒烟检查通过 ✔")

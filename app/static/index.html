@@ -53,6 +53,17 @@
   .alert.info { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; }
   .alert.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--green); }
   .alert.err { background: #fef2f2; border: 1px solid #fecaca; color: var(--red); }
+  .alert.danger {
+    background: #fef2f2; border: 2px solid #ef4444; color: var(--red);
+    font-weight: 600;
+  }
+  input[type="number"] {
+    width: 78px; padding: 5px 6px; border: 1px solid var(--line);
+    border-radius: 6px; font-size: 13px; text-align: right;
+  }
+  input[type="number"].bad { border-color: #ef4444; background: #fef2f2; }
+  tr.alert-row { background: #fee2e2; font-weight: 600; }
+  .lr-hot { color: var(--red); font-weight: 700; }
   .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
   .stat {
     border: 1px solid var(--line); border-radius: 8px; padding: 12px;
@@ -77,7 +88,7 @@
 <body>
 <header>
   <h1>返修机故障占比估算</h1>
-  <p>上传 CSV（机器编号 + 分类器初判，≤500 台），随机拆检登记实检类别，实时拟合未检件故障占比</p>
+  <p>上传 CSV（机器编号 + 分类器初判，≤500 台），随机拆检登记实检类别，实时拟合未检件故障占比，并按出厂参考矩阵累计似然比、监测校准漂移</p>
 </header>
 <main>
   <section class="card">
@@ -101,8 +112,52 @@
     <div id="fitDetail" style="margin-top:14px"></div>
   </section>
 
+  <section class="card" id="driftCard" hidden>
+    <h2>3. 漂移监测（出厂校准偏离预警）</h2>
+    <div id="driftAlertBox"></div>
+    <div class="row" style="align-items:flex-start; gap:24px; flex-wrap:wrap">
+      <div>
+        <p class="muted" style="margin:0 0 8px">
+          参考混淆概率矩阵（行＝实检类别，列＝初判类别；每项为正，每行和为 1）
+        </p>
+        <table style="width:auto">
+          <thead>
+            <tr><th class="left">实检 ＼ 初判</th>
+              <th>电源</th><th>驱动</th><th>控制</th><th>行和</th></tr>
+          </thead>
+          <tbody id="refMatrixRows"></tbody>
+        </table>
+        <div class="row" style="margin-top:10px">
+          <button id="refSubmitBtn">录入 / 更换参考矩阵并重算</button>
+          <button class="ghost small" id="refResetBtn">恢复默认矩阵</button>
+          <span class="muted">无效输入会被拒绝，当前矩阵与告警保持不变</span>
+        </div>
+      </div>
+      <div style="flex:1; min-width:320px">
+        <p class="muted" style="margin:0 0 8px">
+          各实检类别累计似然比（从 1 开始，按登记顺序乘加一平滑预测概率／参考概率，阈值 60）
+        </p>
+        <div class="grid3" id="lrGrid"></div>
+      </div>
+    </div>
+    <div style="margin-top:14px">
+      <p class="muted" style="margin:0 0 6px">
+        登记顺序（更正保留原位置；撤回移除记录；再登记排到末尾）
+      </p>
+      <div class="table-scroll" style="max-height:260px">
+        <table style="max-width:720px">
+          <thead>
+            <tr><th>序号</th><th class="left">机器编号</th>
+              <th>初判类别</th><th>实检类别</th><th>备注</th></tr>
+          </thead>
+          <tbody id="orderRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <section class="card" id="machineCard" hidden>
-    <h2>3. 拆检登记 / 更正 / 撤回</h2>
+    <h2>4. 拆检登记 / 更正 / 撤回</h2>
     <div class="row filters" style="margin-bottom:10px">
       <span class="muted">筛选：</span>
       <button class="ghost small on" data-filter="all">全部</button>
@@ -130,6 +185,12 @@
 <script>
 const CATS = ["power", "drive", "control"];
 const LABELS = {power: "电源", drive: "驱动", control: "控制"};
+// 出厂校准默认参考矩阵（行=实检，列=初判，每行和为 1）。
+const DEFAULT_REF = [
+  [0.80, 0.13, 0.07],
+  [0.12, 0.78, 0.10],
+  [0.05, 0.15, 0.80],
+];
 let state = null;
 let filter = "all";
 let pollTimer = null;
@@ -165,9 +226,35 @@ document.getElementById("uploadBtn").addEventListener("click", async () => {
   fd.append("file", f);
   try {
     state = await api("/api/batch", {method: "POST", body: fd});
-    toast(`已载入 ${state.estimate.n_total} 台机器`);
+    // 新批次：清空监测，本地参考矩阵输入框也重置为默认值。
+    fillRefMatrix(DEFAULT_REF);
+    toast(`已载入 ${state.estimate.n_total} 台机器，漂移监测已重置`);
     render();
   } catch (e) { toast(e.message, true); }
+});
+
+document.getElementById("refResetBtn").addEventListener("click", () => {
+  fillRefMatrix(DEFAULT_REF);
+  toast("已恢复默认参考矩阵（尚未提交，提交后才生效）");
+});
+
+document.getElementById("refSubmitBtn").addEventListener("click", async () => {
+  const matrix = readRefMatrix();
+  if (!matrix) return toast("矩阵含非正数或非数值，请先修正", true);
+  try {
+    state = await api("/api/drift/reference", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({matrix}),
+    });
+    toast("参考矩阵已生效，本批似然比与告警已重算");
+    render();
+  } catch (e) { toast(e.message, true); }
+});
+document.addEventListener("input", ev => {
+  if (ev.target.matches && ev.target.matches("#refMatrixRows input")) {
+    updateRowSums();
+  }
 });
 
 document.getElementById("refreshBtn").addEventListener("click", refresh);
@@ -208,10 +295,117 @@ async function withdraw(id) {
 function render() {
   if (!state) return;
   document.getElementById("estimateCard").hidden = false;
+  document.getElementById("driftCard").hidden = false;
   document.getElementById("machineCard").hidden = false;
   renderEstimate();
+  renderDrift();
   renderMachines();
   if (!pollTimer) pollTimer = setInterval(refresh, 3000);
+}
+
+function fmtLR(x) {
+  if (!isFinite(x)) return x > 0 ? "∞" : "—";
+  if (x >= 1000) return x.toExponential(3);
+  return x.toFixed(3);
+}
+
+function fillRefMatrix(matrix) {
+  const tbody = document.getElementById("refMatrixRows");
+  tbody.innerHTML = CATS.map((r, i) => {
+    const cells = CATS.map((_, j) =>
+      `<td><input type="number" step="any" min="0" data-r="${i}" data-c="${j}"
+        value="${matrix[i][j]}"></td>`).join("");
+    return `<tr><th>${LABELS[r]}实检</th>${cells}
+      <td class="muted" id="rowsum-${i}"></td></tr>`;
+  }).join("");
+  updateRowSums();
+}
+
+function readRefMatrix() {
+  const values = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  let ok = true;
+  document.querySelectorAll("#refMatrixRows input").forEach(inp => {
+    const v = Number(inp.value);
+    if (!isFinite(v) || v <= 0) ok = false;
+    inp.classList.toggle("bad", !isFinite(v) || v <= 0);
+    values[Number(inp.dataset.r)][Number(inp.dataset.c)] = v;
+  });
+  updateRowSums();
+  return ok ? values : null;
+}
+
+function updateRowSums() {
+  for (let i = 0; i < 3; i++) {
+    const inputs = document.querySelectorAll(
+      `#refMatrixRows input[data-r="${i}"]`);
+    let sum = 0;
+    inputs.forEach(inp => { const v = Number(inp.value); if (isFinite(v)) sum += v; });
+    const cell = document.getElementById(`rowsum-${i}`);
+    if (cell) {
+      cell.textContent = sum.toFixed(4);
+      cell.classList.toggle("lr-hot", Math.abs(sum - 1) > 1e-6);
+    }
+  }
+}
+
+function renderDrift() {
+  const d = state.drift;
+  const tbody = document.getElementById("refMatrixRows");
+  if (!tbody.children.length) {
+    // 首次进入：用已生效矩阵回填，否则给默认值便于直接修改提交。
+    fillRefMatrix(d.configured ? d.reference_matrix : DEFAULT_REF);
+  }
+  // 轮询同步时不覆盖用户正在编辑但尚未提交的输入框，避免打字被打断。
+
+  const alertBox = document.getElementById("driftAlertBox");
+  if (!d.configured) {
+    alertBox.innerHTML =
+      '<div class="alert warn">尚未录入有效参考矩阵：请在左下方填写并提交，' +
+      '提交后按当前本批登记记录整体重算似然比与告警。</div>';
+  } else if (d.alert) {
+    const a = d.alert;
+    alertBox.innerHTML =
+      `<div class="alert danger">🚨 漂移告警（保留中）：首个偏离出厂校准的证据来自机器 ` +
+      `<code>${a.machine_id}</code>（实检类别：${a.category_label}，` +
+      `登记序号 #${a.order}），当时累计似然比 ${fmtLR(a.lr)} ≥ 阈值 ${a.threshold}。` +
+      `即使比值回落，告警仍保留；更正/撤回导致重算后若无过线点则撤下。</div>`;
+  } else {
+    alertBox.innerHTML =
+      `<div class="alert ok">暂无过线：各类别累计似然比均未达到阈值 ${d.threshold}。</div>`;
+  }
+
+  const lrGrid = document.getElementById("lrGrid");
+  lrGrid.innerHTML = CATS.map(c => {
+    const v = d.likelihood_ratios[c];
+    const hot = d.configured && v >= d.threshold;
+    const counts = d.sample_counts[c];
+    const n = CATS.reduce((s, k) => s + counts[k], 0);
+    return `<div class="stat">
+      <div class="label">${LABELS[c]}（${c}）实检 · 已登记 ${n} 台</div>
+      <div class="value ${hot ? "lr-hot" : ""}">${d.configured ? fmtLR(v) : "—"}</div>
+      <div class="sub">初判计数 电源${counts.power}/驱动${counts.drive}/控制${counts.control}</div>
+    </div>`;
+  }).join("");
+
+  const byId = Object.fromEntries(state.machines.map(m => [m.id, m]));
+  const orderBody = document.getElementById("orderRows");
+  if (!d.order.length) {
+    orderBody.innerHTML =
+      '<tr><td colspan="5" class="muted">尚无登记记录</td></tr>';
+    return;
+  }
+  const alertId = d.alert ? d.alert.machine_id : null;
+  orderBody.innerHTML = d.order.map((mid, i) => {
+    const m = byId[mid] || {};
+    const isAlert = mid === alertId;
+    return `<tr class="${isAlert ? "alert-row" : ""}">
+      <td>${i + 1}</td>
+      <td class="left"><code>${mid}</code></td>
+      <td>${badge(m.initial)}</td>
+      <td>${badge(m.inspected)}</td>
+      <td>${isAlert ? "🚩 首个过线点" : ""}</td>
+    </tr>`;
+  }).join("");
 }
 
 function renderEstimate() {
